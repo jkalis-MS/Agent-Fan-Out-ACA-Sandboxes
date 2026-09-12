@@ -8,7 +8,7 @@ Submit a topic and a swarm of isolated agents researches it in parallel. The orc
 
 ## Architecture
 
-![Architecture](images/architecture.png)
+![Architecture](docs/images/architecture.png)
 
 | Folder | Component | Role |
 |---|---|---|
