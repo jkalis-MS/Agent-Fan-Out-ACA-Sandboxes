@@ -16,7 +16,7 @@ The application accepts a research topic, asks a decomposer to produce sub-quest
 
 **Who this is for:** teams building agents that need parallel execution, custom code, strong isolation, controlled egress, keyless Azure access where supported, and one observable path across the full workflow.
 
-![Research agent fan-out architecture](images/architecture.png)
+![Research agent fan-out architecture](images/arch.png)
 
 The flow of information is simple:
 

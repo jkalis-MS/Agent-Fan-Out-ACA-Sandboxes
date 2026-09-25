@@ -8,7 +8,7 @@ Submit a topic and multiple isolated agents researches it in parallel. The orche
 
 ## Architecture
 
-![Architecture](docs/images/architecture.png)
+![Architecture](docs/images/arch.png)
 
 | Folder | Component | Role |
 |---|---|---|
