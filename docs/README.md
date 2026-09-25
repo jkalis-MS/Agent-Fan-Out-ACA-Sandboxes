@@ -1,4 +1,4 @@
-# Your Agent Swarm Needs More Than a Loop
+# Your Agent Fan-out Needs More Than a Loop
 
 One agent is easy to picture. Give it a prompt. Let it call a tool. Read the answer.
 
@@ -6,7 +6,7 @@ Then you add five more.
 
 Now the real questions show up. Do they actually run concurrently? Where does their code execute? What can each agent reach on the network? How do you preload your frameworks and proprietary code without installing everything six times? And when one branch fails, can you trace the request from the original topic to the exact sandbox that went sideways?
 
-We built a research swarm to work through those questions with real infrastructure. Not a diagram that stops at the model call. A deployable workflow built with Microsoft Agent Framework, an orchestrator running as an Azure Container Apps application, and isolated researchers running inside Azure Container Apps Sandboxes.
+We built a research fan-out to work through those questions with real infrastructure. Not a diagram that stops at the model call. A deployable workflow built with Microsoft Agent Framework, an orchestrator running as an Azure Container Apps application, and isolated researchers running inside Azure Container Apps Sandboxes.
 
 That distinction matters. Azure Container Apps hosts the long-running web application and workflow orchestrator. ACA Sandboxes provide the separate, ephemeral execution environments where individual researchers do their work.
 
@@ -16,7 +16,7 @@ The application accepts a research topic, asks a decomposer to produce sub-quest
 
 **Who this is for:** teams building agents that need parallel execution, custom code, strong isolation, controlled egress, keyless Azure access where supported, and one observable path across the full workflow.
 
-![Research agent swarm architecture](images/architecture.png)
+![Research agent fan-out architecture](images/architecture.png)
 
 The flow of information is simple:
 
@@ -89,7 +89,7 @@ Every sandbox starts with default-deny egress. The orchestrator adds allow rules
 
 - Azure OpenAI for the direct model path
 - Microsoft Foundry for the hosted research path
-- Application Insights ingestion endpoints for telemetry
+- Application Insights ingestion/live endpoints for telemetry, with public Azure Monitor regional hosts for redirects and exporter health metrics
 
 The policy is built with `default_action="Deny"`:
 
@@ -98,7 +98,7 @@ _allow(self.openai_endpoint)
 _allow(self.foundry_project_endpoint)
 
 for endpoint in self._appinsights_egress_endpoints():
-    _allow(endpoint)
+    _allow(endpoint, include_siblings=False)
 
 return EgressPolicy(
     default_action="Deny",
@@ -107,6 +107,8 @@ return EgressPolicy(
 ```
 
 There is no search-engine allow rule.
+
+Telemetry endpoints come from `APPLICATIONINSIGHTS_CONNECTION_STRING`, including `EndpointSuffix` / `Location` and independent ingestion/live defaults. Custom collectors receive exact-host rules. For public Azure Monitor endpoints, the policy also allows `*.in.applicationinsights.azure.com` and `*.livediagnostics.monitor.azure.com`. Without a connection string, no telemetry rules are added. The egress probe tests configured telemetry endpoints alongside AI endpoints and blocked destinations.
 
 That is not an omission. The researcher uses Foundry hosted web search, and the search runs server-side in Foundry. From inside the sandbox, the agent calls the Foundry project endpoint. Foundry performs the search. The sandbox does not need direct access to Bing or another public search engine.
 
@@ -146,7 +148,7 @@ There is one more practical step. The FastAPI lifespan hook starts disk-image pr
 
 Push new researcher code to ACR. The digest changes. The next preparation cycle rebuilds once. Later requests reuse the matching `Ready` image.
 
-## 4. Connect the swarm with one distributed trace
+## 4. Connect your agnets with one distributed trace
 
 Parallel systems fail in parallel too. A log line that says "research failed" is not enough when six sandboxes, several model calls, and a synthesis step are active.
 
@@ -182,7 +184,7 @@ azd up
 
 After that, the orchestrator prepares the digest-cached researcher disk image and starts accepting topics.
 
-The lesson for me was simple. A swarm is not six copies of the same prompt. It is a workflow, an execution boundary, an image lifecycle, an identity path, a network policy, and a trace that survives the fan-out.
+The lesson for me was simple. A fan-out is not six copies of the same prompt. It is a workflow, an execution boundary, an image lifecycle, an identity path, a network policy, and a trace that survives the fan-out.
 
 Build those pieces together and the concurrency becomes the easy part.
 

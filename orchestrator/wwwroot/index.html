@@ -3,23 +3,111 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ACA Sandboxes — Research Agent Swarm</title>
+<title>ACA Sandboxes — Research Agent Fan-out</title>
+<script>
+(() => {
+  const storageKey = 'aca-research-theme';
+  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+  let preference = null;
+  let storageNotice = '';
+
+  function showStorageNotice() {
+    const notice = document.getElementById('theme-notice');
+    if (!notice) return;
+    notice.textContent = storageNotice;
+    notice.hidden = !storageNotice;
+  }
+
+  function reportStorageError(message, error) {
+    storageNotice = message;
+    console.warn(message, error);
+    showStorageNotice();
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    const toggle = document.getElementById('theme-toggle');
+    if (toggle) {
+      toggle.setAttribute('aria-pressed', String(theme === 'dark'));
+      toggle.title = `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`;
+    }
+  }
+
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved === 'light' || saved === 'dark') preference = saved;
+  } catch (error) {
+    reportStorageError('Could not read your saved theme. Using your system theme until you choose a mode.', error);
+  }
+
+  // Set the theme before styles are parsed to avoid a wrong-theme flash.
+  applyTheme(preference || (systemTheme.matches ? 'dark' : 'light'));
+  systemTheme.addEventListener('change', event => {
+    if (!preference) applyTheme(event.matches ? 'dark' : 'light');
+  });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    applyTheme(document.documentElement.dataset.theme);
+    showStorageNotice();
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      preference = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+      applyTheme(preference);
+      try {
+        localStorage.setItem(storageKey, preference);
+        storageNotice = '';
+        showStorageNotice();
+      } catch (error) {
+        reportStorageError('Theme changed for this page, but your choice could not be saved. It may reset on reload.', error);
+      }
+    });
+  });
+})();
+</script>
 <style>
   :root {
+    color-scheme: dark;
     --bg-primary: #0d1117;
     --bg-secondary: #161b22;
     --bg-tertiary: #1c2333;
     --border: #30363d;
     --text-primary: #e6edf3;
     --text-secondary: #8b949e;
-    --text-muted: #484f58;
-    --accent: #58a6ff;
-    --accent-green: #3fb950;
-    --accent-yellow: #d29922;
-    --accent-red: #f85149;
+    --text-muted: #848d97;
+    --accent-rgb: 88, 166, 255;
+    --accent-green-rgb: 63, 185, 80;
+    --accent-yellow-rgb: 210, 153, 34;
+    --accent-red-rgb: 248, 81, 73;
+    --accent: rgb(var(--accent-rgb));
+    --accent-green: rgb(var(--accent-green-rgb));
+    --accent-yellow: rgb(var(--accent-yellow-rgb));
+    --accent-red: rgb(var(--accent-red-rgb));
     --accent-purple: #bc8cff;
     --accent-cyan: #39d353;
     --card-hover: #1f2937;
+    --text-on-accent: #0d1117;
+    --hint-text: #f9d88a;
+    --hint-strong: #ffe59a;
+  }
+
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg-primary: #f6f8fa;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #eef2f6;
+    --border: #d1d9e0;
+    --text-primary: #1f2328;
+    --text-secondary: #59636e;
+    --text-muted: #59636e;
+    --accent-rgb: 9, 105, 218;
+    --accent-green-rgb: 26, 127, 55;
+    --accent-yellow-rgb: 130, 92, 0;
+    --accent-red-rgb: 207, 34, 46;
+    --accent-purple: #8250df;
+    --accent-cyan: #116329;
+    --card-hover: #f0f4f8;
+    --text-on-accent: #ffffff;
+    --hint-text: #684b00;
+    --hint-strong: #533b00;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -29,6 +117,9 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     min-height: 100vh;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
   }
 
   .header {
@@ -36,6 +127,8 @@
     border-bottom: 1px solid var(--border);
     padding: 1rem 2rem;
     display: flex;
+    flex-wrap: wrap;
+    flex-shrink: 0;
     align-items: center;
     gap: 1rem;
   }
@@ -57,7 +150,36 @@
     color: var(--text-secondary);
   }
 
-  .main { display: flex; height: calc(100vh - 56px); }
+  .theme-toggle {
+    margin-left: auto;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .theme-toggle[aria-pressed="true"] {
+    background: rgba(var(--accent-rgb), 0.15);
+    border-color: var(--accent);
+  }
+  .theme-toggle:hover { background: var(--card-hover); }
+  .theme-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+  .theme-notice {
+    padding: 0.5rem 2rem;
+    border-bottom: 1px solid var(--border);
+    background: rgba(var(--accent-yellow-rgb), 0.12);
+    color: var(--hint-text);
+    font-size: 0.8rem;
+  }
+
+  .main { display: flex; flex: 1; min-height: 0; }
 
   .content { flex: 1; overflow-y: auto; padding: 1.5rem; }
 
@@ -159,7 +281,7 @@
 
   .btn-primary {
     background: linear-gradient(135deg, var(--accent), var(--accent-purple));
-    color: #fff;
+    color: var(--text-on-accent);
   }
 
   .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
@@ -170,12 +292,12 @@
     margin: 0 0 1rem;
     padding: 0.8rem 1rem;
     border-radius: 8px;
-    border: 1px solid rgba(210, 153, 34, 0.45);
-    background: rgba(210, 153, 34, 0.12);
-    color: #f9d88a;
+    border: 1px solid rgba(var(--accent-yellow-rgb), 0.45);
+    background: rgba(var(--accent-yellow-rgb), 0.12);
+    color: var(--hint-text);
   }
   .hint-banner.visible { display: block; }
-  .hint-banner strong { color: #ffe59a; }
+  .hint-banner strong { color: var(--hint-strong); }
   .hint-banner .hint-meta {
     margin-top: 0.4rem;
     color: var(--text-secondary);
@@ -238,10 +360,10 @@
     letter-spacing: 0.04em;
   }
 
-  .status-provisioning { background: rgba(210, 153, 34, 0.15); color: var(--accent-yellow); border: 1px solid rgba(210, 153, 34, 0.3); }
-  .status-researching  { background: rgba(88, 166, 255, 0.15); color: var(--accent); border: 1px solid rgba(88, 166, 255, 0.3); }
-  .status-done         { background: rgba(63, 185, 80, 0.15);  color: var(--accent-green); border: 1px solid rgba(63, 185, 80, 0.3); }
-  .status-error        { background: rgba(248, 81, 73, 0.15);  color: var(--accent-red); border: 1px solid rgba(248, 81, 73, 0.3); }
+  .status-provisioning { background: rgba(var(--accent-yellow-rgb), 0.15); color: var(--accent-yellow); border: 1px solid rgba(var(--accent-yellow-rgb), 0.3); }
+  .status-researching  { background: rgba(var(--accent-rgb), 0.15); color: var(--accent); border: 1px solid rgba(var(--accent-rgb), 0.3); }
+  .status-done         { background: rgba(var(--accent-green-rgb), 0.15); color: var(--accent-green); border: 1px solid rgba(var(--accent-green-rgb), 0.3); }
+  .status-error        { background: rgba(var(--accent-red-rgb), 0.15); color: var(--accent-red); border: 1px solid rgba(var(--accent-red-rgb), 0.3); }
 
   .agent-question {
     color: var(--text-secondary);
@@ -351,7 +473,9 @@
   .report-box p { margin-bottom: 0.5rem; }
   .report-box strong { color: var(--accent-green); }
   .report-box em { color: var(--text-secondary); }
-  .report-box code { background: var(--bg-tertiary); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.85em; }
+  .report-box code, .answer-body code { background: var(--bg-tertiary); color: var(--text-primary); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.85em; }
+  .report-box pre, .answer-body pre { background: var(--bg-tertiary); padding: 0.75rem; border-radius: 6px; overflow-x: auto; }
+  .report-box pre code, .answer-body pre code { background: none; padding: 0; }
   .report-box blockquote { border-left: 3px solid var(--accent-purple); padding-left: 1rem; color: var(--text-secondary); margin: 0.5rem 0; }
   .report-box hr { border: none; border-top: 1px solid var(--border); margin: 1rem 0; }
 
@@ -431,15 +555,19 @@
 </head>
 <body>
   <div class="header">
-    <h1>🔬 ACA Sandboxes — Research Agent Swarm</h1>
-    <span class="badge">v0.6.14</span>
+    <h1>🔬 ACA Sandboxes — Research Agent Fan-out</h1>
+    <span class="badge">v0.9.24</span>
     <span class="badge" id="ws-status">● Disconnected</span>
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-pressed="false">
+      <span aria-hidden="true">◐</span> Dark mode
+    </button>
   </div>
+  <p class="theme-notice" id="theme-notice" role="status" hidden></p>
 
   <div class="main">
     <div class="content">
       <div class="input-bar">
-        <input type="text" id="topic-input" placeholder="Enter a research topic, e.g. 'Quantum computing advances in 2024'" />
+        <input type="text" id="topic-input" placeholder="Enter a research topic, e.g. 'Quantum computing advances in 2026'" />
         <button class="btn btn-primary" id="research-btn" onclick="startResearch()">🔍 Research</button>
       </div>
 
@@ -491,12 +619,12 @@ function connect() {
 
   ws.onopen = () => {
     document.getElementById('ws-status').textContent = '● Connected';
-    document.getElementById('ws-status').style.color = '#3fb950';
+    document.getElementById('ws-status').style.color = 'var(--accent-green)';
   };
 
   ws.onclose = () => {
     document.getElementById('ws-status').textContent = '● Disconnected';
-    document.getElementById('ws-status').style.color = '#f85149';
+    document.getElementById('ws-status').style.color = 'var(--accent-red)';
     setTimeout(connect, 3000);
   };
 

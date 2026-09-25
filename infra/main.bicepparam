@@ -1,6 +1,6 @@
 using 'main.bicep'
 
-param prefix             = 'aca-sandboxes-agents'
+param prefix             = 'aca-sandbox'
 param location           = readEnvironmentVariable('AZURE_LOCATION', 'westus3')
 param openAiLocation     = readEnvironmentVariable('AZURE_OPENAI_LOCATION', 'westus3')
 param gpt5MiniModelVersion = ''

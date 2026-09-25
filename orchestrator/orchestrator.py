@@ -238,7 +238,7 @@ async def recreate_disk_image() -> dict:
 async def egress_probe(wait: int = 120) -> dict:
     """Diagnostic: spin up a throwaway sandbox, let the research agent make its
     outbound calls, and report the stored egress policy plus which hosts were
-    actually allowed/denied. Confirms default-deny + Foundry/AOAI-only egress.
+    actually allowed/denied. Checks default-deny + AI/telemetry egress.
 
     The sandbox stays alive for `wait` seconds (default 120) so you can inspect
     it in the portal or curl it while it runs.

@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
 #
-# `azd up` workflow for the Research Agent Swarm:
+# `azd up` workflow for the Research Agent Fan-out:
 #
 #   1. `azd up`
 #        - Provisions infra/main.bicep (ACR, AOAI, ACA env, sandbox group, orchestrator app, role assignments)
@@ -16,9 +16,9 @@
 # To rebuild infra only:  `azd provision`
 # To tear down:           `azd down`
 
-name: aca-sandboxes-agents
+name: aca-sandbox
 metadata:
-  template: aca-sandboxes-agents@1.0.0
+  template: aca-sandbox@1.0.0
 
 infra:
   provider: bicep

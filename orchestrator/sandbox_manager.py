@@ -17,8 +17,8 @@ SDK API surface used:
     - Models: DiskImage, Sandbox, EgressPolicy, AddPortRequest, PortAuthConfig,
       RegistryCredentials, endpoint_for_region.
 
-Tested against ``azure-containerapps-sandbox 0.1.0b1``
-(release ``python-sdk-v0.1.0b1-early-access``).
+Tested against ``azure-containerapps-sandbox 0.1.0b4``
+(local regression and SDK request-compatibility tests; HTTP mocked).
 """
 from __future__ import annotations
 
@@ -727,58 +727,91 @@ class SandboxManager:
     # ── Sandbox lifecycle ──────────────────────────────────────────────────
 
     def _build_egress_policy(self) -> EgressPolicy:
-        """Default-deny egress; allow only the Azure OpenAI / Foundry endpoints.
+        """Allow AI endpoints and configured telemetry; deny all other egress.
 
-        Every research sandbox starts fully network-isolated. We punch a single
-        hole for the AOAI / Foundry hosts the agent needs for model inference and
-        hosted web search, so an autonomous workload can reach the model (and the
-        Foundry-side grounding tool) and nothing else. Web search runs server-side
-        in Foundry, so no bing.com / search-engine egress is ever required.
+        Web search runs server-side in Foundry, so no search-engine rule is needed.
         """
         host_rules: list[EgressHostRule] = []
         seen: set[str] = set()
 
-        def _allow(url: str | None) -> None:
+        def _allow_pattern(pattern: str) -> None:
+            if pattern not in seen:
+                seen.add(pattern)
+                host_rules.append(EgressHostRule(pattern=pattern, action="Allow"))
+
+        def _allow(url: str | None, include_siblings: bool = True) -> None:
             host = urlparse(url).hostname if url else None
             if not host:
                 return
-            for pattern in (host, f"*.{host.split('.', 1)[1]}" if "." in host else host):
-                if pattern not in seen:
-                    seen.add(pattern)
-                    host_rules.append(EgressHostRule(pattern=pattern, action="Allow"))
+            _allow_pattern(host)
+            if include_siblings and "." in host:
+                _allow_pattern(f"*.{host.split('.', 1)[1]}")
 
         # AOAI data-plane host (model inference + AOAI fallback path).
         _allow(self.openai_endpoint)
         # Foundry project host (hosted web search / grounding via FoundryChatClient).
         _allow(self.foundry_project_endpoint)
-        # Application Insights ingestion (so the in-sandbox agent can export
-        # OpenTelemetry traces). Parsed from the connection string's
-        # Ingestion/Live endpoints; falls back to the public ingestion domains.
+        # Custom telemetry collectors get exact-host rules, not sibling access.
         for endpoint in self._appinsights_egress_endpoints():
-            _allow(endpoint)
+            _allow(endpoint, include_siblings=False)
+            host = urlparse(endpoint).hostname
+            if host and host.endswith((
+                ".applicationinsights.azure.com",
+                ".applicationinsights.microsoft.com",
+                ".services.visualstudio.com",
+                ".livediagnostics.monitor.azure.com",
+            )):
+                # Azure Monitor can redirect to regional ingestion/live hosts;
+                # exporter health metrics also use regional ingestion.
+                _allow_pattern("*.in.applicationinsights.azure.com")
+                _allow_pattern("*.livediagnostics.monitor.azure.com")
         return EgressPolicy(default_action="Deny", host_rules=host_rules)
 
     def _appinsights_egress_endpoints(self) -> list[str]:
-        """Endpoints the in-sandbox OTEL exporter must reach, derived from the
-        Application Insights connection string (Ingestion + Live)."""
+        """Resolve ingestion/live endpoints using Azure Monitor's defaults."""
         if not self.appinsights_conn:
             return []
-        parts = dict(
-            kv.split("=", 1)
-            for kv in self.appinsights_conn.split(";")
-            if "=" in kv
-        )
+        parts: dict[str, str] = {}
+        for item in self.appinsights_conn.split(";"):
+            if not item.strip():
+                continue
+            key, separator, value = item.partition("=")
+            if not separator or not key.strip() or not value.strip():
+                raise ValueError("Invalid Application Insights connection string entry.")
+            parts[key.strip().lower()] = value.strip()
+
+        suffix = parts.get("endpointsuffix")
+        location = parts.get("location")
+        prefix = f"{location}." if location else ""
         endpoints: list[str] = []
-        for key in ("IngestionEndpoint", "LiveEndpoint"):
-            url = parts.get(key)
-            if url:
-                endpoints.append(url)
-        # Fallbacks in case the connection string omits explicit endpoints.
-        if not endpoints:
-            endpoints = [
-                "https://dc.services.visualstudio.com",
-                "https://westus3-0.in.applicationinsights.azure.com",
-            ]
+        for key, service, default in (
+            ("ingestionendpoint", "dc", "https://dc.services.visualstudio.com"),
+            ("liveendpoint", "live", "https://rt.services.visualstudio.com"),
+        ):
+            endpoint = parts.get(key) or (
+                f"https://{prefix}{service}.{suffix}" if suffix else default
+            )
+            try:
+                parsed = urlparse(endpoint)
+                valid = (
+                    parsed.scheme == "https"
+                    and bool(parsed.hostname)
+                    and not parsed.username
+                    and not parsed.password
+                    and parsed.port in (None, 443)
+                    and not parsed.query
+                    and not parsed.fragment
+                    and not any(c.isspace() or c == "*" for c in parsed.netloc)
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError(
+                    f"Application Insights {key} must be an HTTPS endpoint on port 443 "
+                    "without credentials, wildcards, query, or fragment."
+                )
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
         return endpoints
 
     def _create_sandbox_sync(
@@ -929,7 +962,7 @@ class SandboxManager:
         """Create a throwaway sandbox, let the research agent make its outbound
         calls, then read back the *stored* egress policy and the egress-decision
         audit log (which hosts were actually Allowed vs Denied). Useful to verify
-        the default-deny + Foundry/AOAI-only policy is applied and matches the
+        the default-deny + AI/telemetry policy is applied and matches the
         endpoints the researcher really talks to. The sandbox is always deleted.
         """
         async def _emit(msg: str, level: str = "info") -> None:
@@ -971,6 +1004,8 @@ class SandboxManager:
             stored_policy = await asyncio.to_thread(
                 lambda: client.get_egress_policy()._to_dict()
             )
+            # Run probes before reading the audit log so their decisions appear.
+            connectivity = await self._exec_connectivity_test(client)
             decisions = await asyncio.to_thread(client.get_egress_decisions)
 
             def _entries(items) -> list[dict[str, Any]]:
@@ -982,11 +1017,6 @@ class SandboxManager:
             ne = getattr(decisions, "network_egress", None)
             allowed = _entries(getattr(ne, "allowed", None)) if ne else []
             denied = _entries(getattr(ne, "denied", None)) if ne else []
-
-            # In-sandbox connectivity test: prove default-deny is enforced by
-            # hitting an allowed host (Foundry/AOAI) vs disallowed hosts, from
-            # *inside* the sandbox VM via the SDK exec API.
-            connectivity = await self._exec_connectivity_test(client)
 
             agent_result: dict[str, Any] | None = None
             try:
@@ -1020,7 +1050,7 @@ class SandboxManager:
 
     async def _exec_connectivity_test(self, client) -> dict[str, Any]:
         """Run a tiny Python script *inside* the sandbox (via the SDK exec API)
-        that tries HTTPS GETs to allowed hosts (Foundry/AOAI) and denied hosts
+        that tries HTTPS GETs to allowed hosts (AI/telemetry) and denied hosts
         (example.com, bing.com). Proves the default-deny egress policy is
         actually enforced at the network layer, not just stored.
         """
@@ -1039,11 +1069,13 @@ class SandboxManager:
         targets: dict[str, str] = {}
         for h in allowed_hosts:
             targets[f"allowed:{h}"] = f"https://{h}/"
+        for endpoint in self._appinsights_egress_endpoints():
+            targets[f"telemetry:{urlparse(endpoint).hostname}"] = endpoint
         targets["denied:example.com"] = "https://example.com/"
         targets["denied:bing.com"] = "https://www.bing.com/"
 
         script = (
-            "import json,ssl,urllib.request\n"
+            "import json,ssl,urllib.request,urllib.error\n"
             "ctx=ssl.create_default_context();ctx.check_hostname=False;"
             "ctx.verify_mode=ssl.CERT_NONE\n"
             f"targets={targets!r}\n"
@@ -1052,6 +1084,9 @@ class SandboxManager:
             "    try:\n"
             "        r=urllib.request.urlopen(u,timeout=8,context=ctx)\n"
             "        out[k]={'result':'REACHABLE','status':getattr(r,'status',None)}\n"
+            "    except urllib.error.HTTPError as e:\n"
+            "        out[k]={'result':'HTTP_RESPONSE','status':e.code,'error':str(e)}\n"
+            "        e.close()\n"
             "    except Exception as e:\n"
             "        out[k]={'result':'BLOCKED','error':type(e).__name__+': '+str(e)[:120]}\n"
             "print(json.dumps(out))\n"
