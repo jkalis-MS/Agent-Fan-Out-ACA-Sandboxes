@@ -28,8 +28,6 @@ Sandbox telemetry egress is derived from `APPLICATIONINSIGHTS_CONNECTION_STRING`
 
 Prerequisites: [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az login`), the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), Docker, and a subscription with quota for Azure OpenAI (gpt-5-mini), Azure Container Apps, and Azure Container Registry.
 
-The orchestrator pins `azure-containerapps-sandbox==0.1.0b4` in [requirements.txt](orchestrator/requirements.txt) so local installs and container builds use the same SDK release.
-
 ```bash
 azd up
 ```
