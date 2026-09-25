@@ -7,7 +7,7 @@ A FastAPI app that:
 - Runs a MAF Workflow (decompose → fan-out research → fan-in synthesize)
 - Streams workflow events to the UI in real time
 - Each researcher branch provisions an Azure Container Apps Sandbox via
-  the `run_in_sandbox` tool
+  a deterministic MAF executor
 
 Run locally:
     uvicorn orchestrator:app --host 0.0.0.0 --port 5000
@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from agent_framework import WorkflowEvent
@@ -34,6 +34,7 @@ from agents import (                            # noqa: E402
     ResearchInput,
     build_research_workflow,
 )
+from agents.errors import rate_limit_warning, user_error  # noqa: E402
 from sandbox_manager import (                   # noqa: E402
     REGIONS,
     SandboxManager,
@@ -281,16 +282,32 @@ async def prune_all_disk_images() -> dict:
 @app.websocket("/ws/agents")
 async def ws_agents(ws: WebSocket) -> None:
     await ws.accept()
+    active_run: asyncio.Task | None = None
     try:
         while True:
             message = await ws.receive_json()
             if message.get("type") == "research":
+                if active_run is not None:
+                    if not active_run.done():
+                        await ws.send_json({
+                            "type": "log",
+                            "message": "Research is already running. Wait for it to finish.",
+                            "level": "warn",
+                        })
+                        continue
+                    await active_run
                 topic  = message["topic"]
-                asyncio.create_task(_run_research_pipeline(ws, topic))
+                active_run = asyncio.create_task(_run_research_pipeline(ws, topic))
     except WebSocketDisconnect:
         return
     except Exception as ex:
         logger.exception("[WS] Unexpected error: %s", ex)
+    finally:
+        if active_run is not None:
+            if not active_run.done():
+                active_run.cancel()
+            with suppress(asyncio.CancelledError):
+                await active_run
 
 
 async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
@@ -298,8 +315,16 @@ async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
     sandbox_mgr: SandboxManager = app.state.sandbox_mgr
 
     ws_lock = asyncio.Lock()
+    rate_warnings: set[str] = set()
 
     async def emit(payload: dict) -> None:
+        if payload.get("type") == "log":
+            warning = rate_limit_warning(payload.get("message", ""))
+            if warning:
+                if warning in rate_warnings:
+                    return
+                rate_warnings.add(warning)
+                payload = {**payload, "message": warning, "level": "warn"}
         async with ws_lock:
             try:
                 await ws.send_json(payload)
@@ -369,8 +394,9 @@ async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
         #   - WorkflowEvent(type="output") from synthesizer → {type: report}
         #   - WorkflowEvent(type="executor_failed")          → log error
         #   (per-agent {type: "agent"|"result"|"log"} are emitted directly by
-        #    the researcher tool through the `emit` callback above.)
+        #    the sandbox runner through the `emit` callback above.)
         final_report: str | None = None
+        report_summary: dict = {}
         questions_seen = False
 
         stream = workflow.run(
@@ -399,6 +425,8 @@ async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
                     extracted = _extract_text(data)
                     if extracted:
                         final_report = extracted
+                        if isinstance(data, dict):
+                            report_summary = data
 
             elif etype == "executor_completed":
                 source = event.executor_id or ""
@@ -410,19 +438,30 @@ async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
             elif etype == "executor_failed":
                 source = event.executor_id or "?"
                 err = event.details or event.data or ""
+                logger.error("[Executor %s] %s", source, err)
                 await emit({
                     "type": "log",
-                    "message": f"Executor '{source}' failed: {err}",
+                    "message": f"Executor '{source}' failed: {user_error(err)}",
                     "level": "error",
                 })
 
             # Other event types (executor_invoked, executor_completed,
             # superstep_*, status, data, ...) are intentionally ignored:
-            # the per-researcher tool already emits richer UI updates.
+            # the per-researcher runner already emits richer UI updates.
 
         if final_report:
             await emit({"type": "report", "markdown": final_report})
-            await emit({"type": "log", "message": "Research complete!", "level": "success"})
+            successful = report_summary.get("successful")
+            total = report_summary.get("total")
+            if successful == 0:
+                message, level = "No usable research answers were returned.", "error"
+            elif report_summary.get("compiled"):
+                message, level = f"Collected answers ready ({successful}/{total} researchers); AI synthesis unavailable.", "warn"
+            elif successful is not None and successful < total:
+                message, level = f"Partial report ready ({successful}/{total} researchers).", "warn"
+            else:
+                message, level = "Research complete!", "success"
+            await emit({"type": "log", "message": message, "level": level})
         else:
             await emit({"type": "report", "markdown": _fallback_report(topic)})
             await emit({
@@ -431,15 +470,13 @@ async def _run_research_pipeline(ws: WebSocket, topic: str) -> None:
                 "level": "warn",
             })
 
-        # Notify the UI that disk-image / stats panels should refresh.
-        # NOTE: We deliberately do NOT delete the disk image here — it is
-        # cached across runs and only rebuilt when the ACR digest changes
-        # or the user clicks "Re-create disk image".
-        await emit({"type": "sandbox_info_changed"})
-
     except Exception as ex:
         logger.exception("[Pipeline] %s", ex)
-        await emit({"type": "log", "message": f"Pipeline error: {ex}", "level": "error"})
+        await emit({"type": "log", "message": f"Pipeline error: {user_error(ex)}", "level": "error"})
+    finally:
+        # Refresh panels on either outcome; the disk image stays cached.
+        await emit({"type": "sandbox_info_changed"})
+        await emit({"type": "complete"})
 
 
 # ── Static UI (mounted last) ────────────────────────────────────────────────

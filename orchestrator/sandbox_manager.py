@@ -15,10 +15,11 @@ SDK API surface used:
     - SandboxClient (sandbox-scoped instance returned by the LRO poller)
         .get() / .delete() / .exec()
     - Models: DiskImage, Sandbox, EgressPolicy, AddPortRequest, PortAuthConfig,
-      RegistryCredentials, endpoint_for_region.
+      endpoint_for_region.
 
 Tested against ``azure-containerapps-sandbox 0.1.0b4``
-(local regression and SDK request-compatibility tests; HTTP mocked).
+(local regression and SDK request-compatibility tests; v2 MI disk-image pull
+also verified against the live service).
 """
 from __future__ import annotations
 
@@ -44,7 +45,6 @@ from azure.containerapps.sandbox import (
     EgressHostRule,
     EgressPolicy,
     PortAuthConfig,
-    RegistryCredentials,
     Sandbox,
     SandboxClient,
     SandboxGroupClient,
@@ -122,6 +122,26 @@ LABEL_IMAGE_REF    = "image-ref"
 LABEL_OCI_DIGEST   = "oci-digest"
 
 
+SANDBOX_PROVISION_TIMEOUT_SECONDS = 300
+RESEARCH_TIMEOUT_SECONDS = 360
+
+# Static tokens cannot renew inside a sandbox. Cover provisioning, research,
+# and 60s of clock skew and request overhead. Acquire after the create throttle.
+FORWARDED_TOKEN_MIN_LIFETIME_SECONDS = (
+    SANDBOX_PROVISION_TIMEOUT_SECONDS + RESEARCH_TIMEOUT_SECONDS + 60
+)
+
+
+def _require_token_lifetime(expires_on: int, token_name: str) -> None:
+    if expires_on - time.time() <= FORWARDED_TOKEN_MIN_LIFETIME_SECONDS:
+        raise RuntimeError(
+            f"{token_name} has insufficient remaining lifetime; more than "
+            f"{FORWARDED_TOKEN_MIN_LIFETIME_SECONDS}s is required for sandbox "
+            "provisioning and research. Retry when the credential can acquire "
+            "a fresh token; forwarded tokens cannot renew inside the sandbox."
+        )
+
+
 # ── Models ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -161,18 +181,8 @@ class SandboxManager:
         )
         self.container_image = os.environ.get("DISK_IMAGE_ID", "")
 
-        # Optional registry credentials (only needed if image isn't pullable via SG MI)
-        self.registry_username = os.environ.get("ACR_USERNAME")
-        self.registry_token    = os.environ.get("ACR_PASSWORD")
-
-        # Sandbox group's user-assigned identity resource id. The disk-image
-        # creation request must name a managed identity (or explicit registry
-        # credentials) to authenticate the ACR pull; the group-level
-        # imageRegistryCredentials are not auto-applied to disk-image pulls.
-        self.sandbox_group_uami_resource_id = os.environ.get("SANDBOX_GROUP_UAMI_RESOURCE_ID")
-        # clientId of the same UAMI. The disk-image API authenticates the ACR
-        # pull with a managed identity named by its client id (keyless).
-        self.sandbox_group_uami_client_id = os.environ.get("SANDBOX_GROUP_UAMI_CLIENT_ID")
+        # The disk-image service expects a client ID, not an ARM resource ID.
+        self.sandbox_group_uami_client_id = _required("SANDBOX_GROUP_UAMI_CLIENT_ID")
 
         # Azure OpenAI passthrough for the research agent.
         self.openai_endpoint   = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -201,7 +211,6 @@ class SandboxManager:
         self._provisioned_groups: set[str] = set()
         self._current_disk_image_id: str | None = None
         self._current_disk_image_digest: str | None = None
-        self._current_disk_image_created_at: str | None = None
         self._sandbox_endpoints: dict[str, str] = {}  # logical id -> external URL
         self._sbx_clients: dict[str, SandboxClient] = {}  # logical id -> SDK client
         self._sandbox_started_at: dict[str, float] = {}
@@ -234,7 +243,10 @@ class SandboxManager:
             self._group_client = None
         if self._async_credential is not None:
             await self._async_credential.close()
-        # Sync credential has no close method we need to call.
+            self._async_credential = None
+        if self._sync_credential is not None:
+            await asyncio.to_thread(self._sync_credential.close)
+            self._sync_credential = None
 
     # ── Lazy client init ───────────────────────────────────────────────────
 
@@ -268,43 +280,54 @@ class SandboxManager:
     # ── AOAI bearer token (keyless) ────────────────────────────────────────
 
     async def get_aoai_token(self) -> str | None:
-        """Acquire a Cognitive Services AAD bearer token. Cached until 60 s
-        before expiry. Forwarded to sandboxes as AZURE_OPENAI_TOKEN."""
+        """Acquire a Cognitive Services token valid for provisioning + research.
+
+        Forwarded with its issuer expiry as AZURE_OPENAI_TOKEN_EXPIRES_ON.
+        """
         if not self.openai_endpoint:
             return None
 
         if self._async_credential is None:
             self._async_credential = AsyncCredential()
 
-        now = int(time.time())
-        if self._aoai_token and now < self._aoai_token_expires_on - 60:
+        if (
+            self._aoai_token
+            and self._aoai_token_expires_on - time.time()
+            > FORWARDED_TOKEN_MIN_LIFETIME_SECONDS
+        ):
             return self._aoai_token
 
         access = await self._async_credential.get_token(
             "https://cognitiveservices.azure.com/.default"
         )
+        # The underlying credential may itself return a near-expiry cached token.
+        _require_token_lifetime(access.expires_on, "AZURE_OPENAI_TOKEN")
         self._aoai_token = access.token
         self._aoai_token_expires_on = access.expires_on
         return self._aoai_token
 
     async def get_foundry_token(self) -> str | None:
         """Acquire an AAD bearer token for the Foundry project data plane
-        (audience https://ai.azure.com). Cached until 60 s before expiry.
-        Forwarded to sandboxes as AZURE_AI_TOKEN so the researcher's
-        FoundryChatClient can call the project's hosted web-search tool."""
+        (audience https://ai.azure.com), valid for provisioning + research.
+        Forwarded as AZURE_AI_TOKEN with AZURE_AI_TOKEN_EXPIRES_ON so the
+        researcher's FoundryChatClient uses the issuer's actual expiry."""
         if not self.foundry_project_endpoint:
             return None
 
         if self._async_credential is None:
             self._async_credential = AsyncCredential()
 
-        now = int(time.time())
-        if self._foundry_token and now < self._foundry_token_expires_on - 60:
+        if (
+            self._foundry_token
+            and self._foundry_token_expires_on - time.time()
+            > FORWARDED_TOKEN_MIN_LIFETIME_SECONDS
+        ):
             return self._foundry_token
 
         access = await self._async_credential.get_token(
             "https://ai.azure.com/.default"
         )
+        _require_token_lifetime(access.expires_on, "AZURE_AI_TOKEN")
         self._foundry_token = access.token
         self._foundry_token_expires_on = access.expires_on
         return self._foundry_token
@@ -362,50 +385,46 @@ class SandboxManager:
             repo, tag = rest, "latest"
         return registry, repo, tag
 
-    async def _acr_bearer_via_aad(self, registry: str, repo: str) -> str | None:
-        """Exchange an AAD access token for an ACR bearer scoped to repo:pull.
-
-        Used when admin creds aren't configured. Returns None on failure.
-        """
-        try:
-            if self._async_credential is None:
-                self._async_credential = AsyncCredential()
-            aad = await self._async_credential.get_token(
-                "https://management.azure.com/.default"
-            )
-            # Step 1: exchange AAD token for ACR refresh token
-            r = await self._http.post(
-                f"https://{registry}/oauth2/exchange",
-                data={
-                    "grant_type": "access_token",
-                    "service": registry,
-                    "access_token": aad.token,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            r.raise_for_status()
-            refresh = r.json()["refresh_token"]
-            # Step 2: exchange refresh token for access token scoped to repo:pull
-            r = await self._http.post(
-                f"https://{registry}/oauth2/token",
-                data={
-                    "grant_type": "refresh_token",
-                    "service": registry,
-                    "scope": f"repository:{repo}:pull",
-                    "refresh_token": refresh,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            r.raise_for_status()
-            return r.json()["access_token"]
-        except Exception as ex:
-            logger.warning("[Digest] AAD->ACR token exchange failed: %s", ex)
-            return None
+    async def _acr_bearer_via_aad(self, registry: str, repo: str) -> str:
+        """Exchange the orchestrator's Entra token for an ACR repo:pull token."""
+        if self._async_credential is None:
+            self._async_credential = AsyncCredential()
+        aad = await self._async_credential.get_token(
+            "https://management.azure.com/.default"
+        )
+        r = await self._http.post(
+            f"https://{registry}/oauth2/exchange",
+            data={
+                "grant_type": "access_token",
+                "service": registry,
+                "access_token": aad.token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        r.raise_for_status()
+        refresh = r.json().get("refresh_token")
+        if not isinstance(refresh, str) or not refresh:
+            raise RuntimeError("ACR token exchange did not return a refresh token.")
+        r = await self._http.post(
+            f"https://{registry}/oauth2/token",
+            data={
+                "grant_type": "refresh_token",
+                "service": registry,
+                "scope": f"repository:{repo}:pull",
+                "refresh_token": refresh,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        r.raise_for_status()
+        token = r.json().get("access_token")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("ACR token exchange did not return an access token.")
+        return token
 
     async def resolve_oci_digest(self, image_ref: str | None = None) -> str:
         """
         Resolve `registry/repo:tag` to the current `sha256:<hex>` manifest digest.
-        Tries ACR admin creds first; falls back to AAD token exchange.
+        Authenticates with the orchestrator's Entra credential.
         """
         ref = image_ref or self.container_image
         registry, repo, tag = self._parse_image_ref(ref)
@@ -413,24 +432,7 @@ class SandboxManager:
         if "@sha256:" in ref:
             return ref.split("@", 1)[1]
 
-        token: str | None = None
-        if self.registry_username and self.registry_token:
-            basic = base64.b64encode(
-                f"{self.registry_username}:{self.registry_token}".encode()
-            ).decode()
-            token_url = (
-                f"https://{registry}/oauth2/token"
-                f"?service={registry}&scope=repository:{repo}:pull"
-            )
-            r = await self._http.get(
-                token_url, headers={"Authorization": f"Basic {basic}"}
-            )
-            r.raise_for_status()
-            token = r.json()["access_token"]
-        else:
-            # Fall back to AAD-based ACR auth (works when the orchestrator's MI
-            # has AcrPull on the registry — which it does, set by the bicep).
-            token = await self._acr_bearer_via_aad(registry, repo)
+        token = await self._acr_bearer_via_aad(registry, repo)
 
         accept = ", ".join([
             "application/vnd.oci.image.manifest.v1+json",
@@ -438,9 +440,7 @@ class SandboxManager:
             "application/vnd.oci.image.index.v1+json",
             "application/vnd.docker.distribution.manifest.list.v2+json",
         ])
-        headers = {"Accept": accept}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers = {"Accept": accept, "Authorization": f"Bearer {token}"}
 
         manifest_url = f"https://{registry}/v2/{repo}/manifests/{tag}"
         r = await self._http.head(manifest_url, headers=headers)
@@ -457,34 +457,20 @@ class SandboxManager:
     def _create_disk_image_with_labels(self, labels: dict[str, str]) -> DiskImage:
         """Create a disk image carrying our full label dict.
 
-        The SDK's ``create_disk_image()`` only encodes ``labels.name`` (from
-        its ``name=`` kwarg), so we bypass it and call the internal ``_dp_put``
-        with a hand-built body that carries arbitrary labels (image-ref,
-        oci-digest, demo=agents). Registry pull uses the sandbox group's
-        ``imageRegistryCredentials`` (configured in bicep with the SG UAMI +
-        AcrPull on the registry).
+        SDK b4's public method targets the legacy endpoint and drops arbitrary
+        labels. Use v2's source.managedIdentityClientId for the sandbox group's
+        AcrPull identity, retaining our image-ref, oci-digest, and demo labels.
         """
         client = self._get_group_client()
         body: dict[str, Any] = {
             "labels": labels,
-            "image": {"base": self.container_image},
+            "source": {
+                "kind": "registry",
+                "imageUrl": self.container_image,
+                "managedIdentityClientId": self.sandbox_group_uami_client_id,
+            },
         }
-        if self.registry_username and self.registry_token:
-            body["registryCredentials"] = RegistryCredentials(
-                username=self.registry_username,
-                token=self.registry_token,
-            )._to_dict()
-        elif self.sandbox_group_uami_client_id:
-            # Keyless pull: authenticate the ACR pull with the sandbox group's
-            # user-assigned identity (which holds AcrPull on the registry). The
-            # API names the identity by its client id.
-            body["managedIdentityClientId"] = self.sandbox_group_uami_client_id
-        elif self.sandbox_group_uami_resource_id:
-            # Keyless pull: authenticate the ACR pull with the sandbox group's
-            # user-assigned identity (which holds AcrPull on the registry).
-            body["managedIdentityResourceId"] = self.sandbox_group_uami_resource_id
-        # SDK private API — needed because public method drops arbitrary labels.
-        raw = client._dp_put(f"{client._group_path}/diskimages", body)  # type: ignore[attr-defined]
+        raw = client._dp_put(f"{client._group_path}/diskimages/v2", body)  # type: ignore[attr-defined]
         return DiskImage._from_dict(raw)
 
     async def _wait_until_ready(
@@ -573,7 +559,6 @@ class SandboxManager:
             if ready_match is not None:
                 self._current_disk_image_id = ready_match.id
                 self._current_disk_image_digest = current_digest
-                self._current_disk_image_created_at = None
                 await _say(
                     f"Reusing disk image {ready_match.id} — digest matches ACR",
                     "success",
@@ -614,7 +599,6 @@ class SandboxManager:
 
             self._current_disk_image_id = image.id
             self._current_disk_image_digest = current_digest
-            self._current_disk_image_created_at = None
             await _say(f"Disk image ready: {image.id}", "success")
             logger.info("[DiskImage] Ready: %s", image.id)
 
@@ -668,7 +652,6 @@ class SandboxManager:
 
             self._current_disk_image_id = None
             self._current_disk_image_digest = None
-            self._current_disk_image_created_at = None
             try:
                 await asyncio.to_thread(client.delete_disk_image, disk_image_id)
                 await _say(f"Disk image deleted: {disk_image_id}", "success")
@@ -690,17 +673,12 @@ class SandboxManager:
             if (img.labels or {}).get(LABEL_DEMO) == LABEL_DEMO_VALUE
         ]
         if not managed:
-            # Fall back: prune everything if nothing is labelled yet.
-            managed = all_images
-
-        if not managed:
-            await _say("No disk images to prune.", "info")
+            await _say("No managed disk images to prune.", "info")
             return 0
 
         await _say(f"Pruning {len(managed)} disk image(s)...", "info")
         self._current_disk_image_id = None
         self._current_disk_image_digest = None
-        self._current_disk_image_created_at = None
         await self._delete_images_quietly(managed)
         await _say(f"Pruned {len(managed)} disk image(s).", "success")
         return len(managed)
@@ -711,7 +689,6 @@ class SandboxManager:
             "image_ref":     self.container_image,
             "disk_image_id": self._current_disk_image_id,
             "oci_digest":    self._current_disk_image_digest,
-            "created_at":    self._current_disk_image_created_at,
         }
 
     def stats(self) -> dict:
@@ -827,6 +804,7 @@ class SandboxManager:
         client = self._get_group_client()
         poller = client.begin_create_sandbox(
             disk_id=disk_image_id,
+            polling_timeout=SANDBOX_PROVISION_TIMEOUT_SECONDS,
             cpu="500m",
             memory="1Gi",
             ports=[AddPortRequest(port=8080, auth=PortAuthConfig(anonymous=True))],
@@ -851,15 +829,9 @@ class SandboxManager:
             environment["AZURE_OPENAI_ENDPOINT"] = self.openai_endpoint
         if self.openai_deployment:
             environment["AZURE_OPENAI_DEPLOYMENT"] = self.openai_deployment
-        token = await self.get_aoai_token()
-        if token:
-            environment["AZURE_OPENAI_TOKEN"] = token
         # Foundry project + ai.azure.com-scoped token for the hosted web-search tool.
         if self.foundry_project_endpoint:
             environment["FOUNDRY_PROJECT_ENDPOINT"] = self.foundry_project_endpoint
-        foundry_token = await self.get_foundry_token()
-        if foundry_token:
-            environment["AZURE_AI_TOKEN"] = foundry_token
 
         labels = {
             "demo": "agents",
@@ -882,6 +854,25 @@ class SandboxManager:
                 environment.update(_traceparent_env())
 
             async with self._throttle:
+                token = await self.get_aoai_token()
+                if token:
+                    environment["AZURE_OPENAI_TOKEN"] = token
+                    environment["AZURE_OPENAI_TOKEN_EXPIRES_ON"] = str(
+                        self._aoai_token_expires_on
+                    )
+                foundry_token = await self.get_foundry_token()
+                if foundry_token:
+                    environment["AZURE_AI_TOKEN"] = foundry_token
+                    environment["AZURE_AI_TOKEN_EXPIRES_ON"] = str(
+                        self._foundry_token_expires_on
+                    )
+                # Acquiring the second token may have consumed the first one's
+                # budget. Validate the actual pairs being sent, not mutable caches.
+                for token_name in ("AZURE_OPENAI_TOKEN", "AZURE_AI_TOKEN"):
+                    if token_name in environment:
+                        _require_token_lifetime(
+                            int(environment[f"{token_name}_EXPIRES_ON"]), token_name
+                        )
                 sandbox_client, info = await asyncio.to_thread(
                     self._create_sandbox_sync,
                     self._current_disk_image_id,

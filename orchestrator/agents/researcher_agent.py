@@ -1,18 +1,9 @@
 """
-Researcher Agent — MAF agent with a single `run_in_sandbox` tool.
+Sandbox research runner used directly by a MAF workflow executor.
 
-The tool delegates the actual web research to an Azure Container Apps
-**Sandbox** spun up on demand by `SandboxManager`. Each parallel branch in
-the workflow runs its own instance of this agent with its own question.
-
-Notes:
-- `sandbox_mgr`, the per-WebSocket `emit` callable, and the agent `index`
-  are bound via closure when the agent is built. This is more reliable than
-  routing them through `function_invocation_kwargs`, which is filtered by
-  the LLM tool-runner before reaching the tool body.
-- The tool returns a JSON string the agent can include verbatim in its
-  output — we do NOT ask the LLM to re-summarize, so the cost stays low and
-  the trace remains faithful to what the sandbox produced.
+Each parallel branch provisions a sandbox, polls its research agent, and
+returns its JSON result without an outer LLM dispatch or rewrite step.
+The manager, per-WebSocket emit callback, and branch index are bound once.
 """
 from __future__ import annotations
 
@@ -20,15 +11,11 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
-from agent_framework import Agent
-from pydantic import Field
-from typing_extensions import Annotated
+from sandbox_manager import AgentResult, SandboxManager, RESEARCH_TIMEOUT_SECONDS as POLL_TIMEOUT_SECONDS
 
-from sandbox_manager import AgentResult, SandboxManager
-
-from .chat_client import build_chat_client
+from .errors import rate_limit_warning, user_error
 
 logger = logging.getLogger(__name__)
 
@@ -37,32 +24,17 @@ EmitFn = Callable[[dict], Awaitable[None]]
 
 # Poll-loop resilience: a single transient error (e.g. a 502 from the ADC
 # egress proxy while the sandbox port warms up) must not kill a researcher.
-POLL_TIMEOUT_SECONDS = 360
 MAX_CONSECUTIVE_POLL_ERRORS = 8
 
 
-RESEARCHER_INSTRUCTIONS = (
-    "You are a research dispatcher. For the user's question, you MUST call the "
-    "`run_in_sandbox` tool exactly once with that question to obtain the "
-    "research result, then return the tool's JSON output verbatim — do not "
-    "rewrite, summarize, or omit any field."
-)
-
-
-def build_researcher_agent(
+def build_sandbox_researcher(
     agent_id: str,
     sandbox_mgr: SandboxManager,
     emit: EmitFn,
     index: int,
-) -> Agent:
-    """
-    Build a researcher agent with a single tool. `sandbox_mgr`, `emit`, and
-    `index` are captured via closure so the tool always has them available
-    regardless of how the agent framework routes invocation kwargs.
-    """
-    async def run_in_sandbox(
-        question: Annotated[str, Field(description="The research question to investigate.")],
-    ) -> str:
+) -> Callable[[str], Awaitable[str]]:
+    """Bind a branch's sandbox lifecycle and progress reporting."""
+    async def run_in_sandbox(question: str) -> str:
         """Provision an ACA Sandbox, run the research agent, return JSON results."""
         sandbox_id = f"agent-{index}-{uuid.uuid4().hex[:8]}"
 
@@ -83,27 +55,25 @@ def build_researcher_agent(
             await sandbox_mgr.create_sandbox(sandbox_id, question)
         except Exception as ex:
             logger.exception("[%s] create_sandbox failed", agent_id)
+            message = user_error(ex)
             await agent_status("error")
-            await log(f"Failed to create sandbox: {ex}", "error")
+            await log(f"Failed to create sandbox: {message}", "error")
             return json.dumps({
                 "question": question,
-                "answer": f"Sandbox creation failed: {ex}",
+                "answer": "",
                 "sources": [],
                 "confidence": 0.0,
-                "error": str(ex),
+                "error": message,
             })
 
         await agent_status("researching")
         await log(f"Sandbox {sandbox_id} running", "success")
 
-        # Poll until done/error. Tolerate transient errors (e.g. the ADC egress
-        # proxy occasionally returns 502 on /status while the sandbox port warms
-        # up). A single transient failure must NOT kill the researcher, otherwise
-        # its executor fails, never delivers to the fan-in, and the synthesizer
-        # runs with partial results while the UI is stuck on "researching".
+        # Status and result retrieval have independent retry budgets.
         result: AgentResult | None = None
         poll_deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_SECONDS
-        consecutive_errors = 0
+        consecutive_status_errors = 0
+        result_errors = 0
         try:
             heartbeat = 0
             while True:
@@ -122,24 +92,25 @@ def build_researcher_agent(
                     })
                 try:
                     status = await sandbox_mgr.get_status(sandbox_id)
-                    consecutive_errors = 0
+                    consecutive_status_errors = 0
                 except Exception as ex:
-                    consecutive_errors += 1
+                    consecutive_status_errors += 1
                     logger.warning(
                         "[%s] get_status transient error %d/%d: %s",
-                        agent_id, consecutive_errors, MAX_CONSECUTIVE_POLL_ERRORS, ex,
+                        agent_id, consecutive_status_errors, MAX_CONSECUTIVE_POLL_ERRORS, ex,
                     )
-                    if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                    if consecutive_status_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                        message = user_error(ex)
                         await agent_status("error")
                         await log(
-                            f"Agent {index + 1} error: sandbox unreachable ({ex})", "error"
+                            f"Agent {index + 1} error: sandbox unreachable ({message})", "error"
                         )
                         return json.dumps({
                             "question": question,
-                            "answer": f"Sandbox became unreachable: {ex}",
+                            "answer": "",
                             "sources": [],
                             "confidence": 0.0,
-                            "error": str(ex),
+                            "error": message,
                         })
                     continue
                 if status.status == "done":
@@ -147,30 +118,36 @@ def build_researcher_agent(
                         result = await sandbox_mgr.get_result(sandbox_id)
                         break
                     except Exception as ex:
-                        consecutive_errors += 1
-                        logger.warning("[%s] get_result transient error: %s", agent_id, ex)
-                        if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                        result_errors += 1
+                        logger.warning(
+                            "[%s] get_result transient error %d/%d: %s",
+                            agent_id, result_errors, MAX_CONSECUTIVE_POLL_ERRORS, ex,
+                        )
+                        if result_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                            message = user_error(ex)
                             await agent_status("error")
                             await log(
-                                f"Agent {index + 1} error: result unreachable ({ex})", "error"
+                                f"Agent {index + 1} error: result unreachable ({message})", "error"
                             )
                             return json.dumps({
                                 "question": question,
-                                "answer": f"Sandbox result unreachable: {ex}",
+                                "answer": "",
                                 "sources": [],
                                 "confidence": 0.0,
-                                "error": str(ex),
+                                "error": message,
                             })
                         continue
                 if status.status == "error":
+                    logger.warning("[%s] Sandbox error: %s", agent_id, status.error or status.progress)
+                    message = user_error(status.error or status.progress)
                     await agent_status("error")
-                    await log(f"Agent {index + 1} error: {status.progress}", "error")
+                    await log(f"Agent {index + 1} error: {message}", "error")
                     return json.dumps({
                         "question": question,
-                        "answer": f"Sandbox error: {status.progress}",
+                        "answer": "",
                         "sources": [],
                         "confidence": 0.0,
-                        "error": status.error or status.progress,
+                        "error": message,
                     })
                 heartbeat += 1
                 if heartbeat % 5 == 0:
@@ -183,6 +160,11 @@ def build_researcher_agent(
 
         await agent_status("done")
         if result.simulated:
+            warning = rate_limit_warning(result.diagnostics or result.hint or "")
+            if warning:
+                logger.warning("[%s] Simulated result diagnostics: %s", agent_id, result.diagnostics)
+                result.hint = warning
+                result.diagnostics = None
             hint = result.hint or (
                 "Sandbox fell back to simulated output because Azure OpenAI was unavailable."
             )
@@ -198,8 +180,10 @@ def build_researcher_agent(
         await emit({
             "type": "result",
             "index": index,
+            "question": result.question,
             "answer": result.answer,
             "sources": result.sources,
+            "confidence": result.confidence,
             "simulated": result.simulated,
         })
         await log(f"Agent {index + 1} completed research", "success")
@@ -214,10 +198,4 @@ def build_researcher_agent(
             "diagnostics": result.diagnostics,
         })
 
-    return Agent(
-        client=build_chat_client(),
-        instructions=RESEARCHER_INSTRUCTIONS,
-        name=agent_id,
-        tools=[run_in_sandbox],
-        default_options={"reasoning": {"effort": "low"}},
-    )
+    return run_in_sandbox

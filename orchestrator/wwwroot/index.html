@@ -449,6 +449,19 @@
 
   .report-section.visible { display: block; }
 
+  .synthesis-progress { margin-bottom: 0.75rem; }
+  .synthesis-progress [hidden] { display: none; }
+  .synthesis-status { display: flex; align-items: center; gap: 0.5rem; }
+  .synthesis-percent { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .synthesis-detail { color: var(--text-secondary); font-size: 0.8rem; }
+  .synthesis-progress progress {
+    display: block;
+    width: 100%;
+    height: 0.5rem;
+    margin: 0.6rem 0;
+    accent-color: var(--accent);
+  }
+
   .report-box {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -585,6 +598,15 @@
 
       <div class="report-section" id="report-section">
         <div class="section-title">📄 Synthesized Report</div>
+        <div class="synthesis-progress" id="synthesis-progress" hidden>
+          <div class="synthesis-status">
+            <span class="spinner" id="synthesis-spinner" aria-hidden="true"></span>
+            <span id="synthesis-message" role="status"></span>
+            <span class="synthesis-percent" id="synthesis-percent"></span>
+          </div>
+          <progress id="synthesis-bar" max="100" value="0" aria-label="Estimated summary generation progress"></progress>
+          <div class="synthesis-detail" id="synthesis-detail"></div>
+        </div>
         <div class="report-box" id="report-content"></div>
       </div>
     </div>
@@ -612,6 +634,11 @@
 let ws = null;
 const agents = {};
 const hintAgents = new Set();
+let synthesisTimer = null;
+let synthesisStartedAt = 0;
+let synthesisPending = false;
+let reportReady = false;
+let researchRunning = false;
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -623,6 +650,8 @@ function connect() {
   };
 
   ws.onclose = () => {
+    interruptSynthesis('Connection lost. Reconnect and retry to generate the report.');
+    setResearchRunning(false);
     document.getElementById('ws-status').textContent = '● Disconnected';
     document.getElementById('ws-status').style.color = 'var(--accent-red)';
     setTimeout(connect, 3000);
@@ -648,6 +677,13 @@ function handleMessage(msg) {
     case 'report':
       showReport(msg.markdown);
       break;
+    case 'synthesis':
+      showSynthesisProgress(msg.status);
+      break;
+    case 'complete':
+      interruptSynthesis('Summary generation stopped. Check the event log and retry.');
+      setResearchRunning(false);
+      break;
     case 'log':
       addLog(msg.message, msg.level);
       break;
@@ -660,26 +696,40 @@ function handleMessage(msg) {
   }
 }
 
+function setResearchRunning(running) {
+  researchRunning = running;
+  document.getElementById('research-btn').disabled = running;
+}
+
 function startResearch() {
   const input = document.getElementById('topic-input');
   const topic = input.value.trim();
-  if (!topic || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (researchRunning || !topic || !ws || ws.readyState !== WebSocket.OPEN) return;
+  setResearchRunning(true);
 
   // Reset UI
+  resetSynthesisProgress();
   document.getElementById('empty-state').style.display = 'none';
   document.getElementById('agents-section').style.display = 'block';
   document.getElementById('agent-grid').innerHTML = '';
   document.getElementById('report-section').classList.remove('visible');
   document.getElementById('report-content').innerHTML = '';
-  document.getElementById('research-btn').disabled = true;
   hideHint();
   hintAgents.clear();
 
-  ws.send(JSON.stringify({ type: 'research', topic }));
+  try {
+    ws.send(JSON.stringify({ type: 'research', topic }));
+  } catch (ex) {
+    setResearchRunning(false);
+    addLog('Could not start research: ' + ex, 'error');
+    return;
+  }
   addLog(`Starting research: "${topic}"`, 'info');
 }
 
 function showQuestions(questions) {
+  resetSynthesisProgress();
+  Object.keys(agents).forEach(key => delete agents[key]);
   const grid = document.getElementById('agent-grid');
   grid.innerHTML = '';
 
@@ -704,6 +754,7 @@ function showQuestions(questions) {
 function updateAgent(msg) {
   const badge = document.getElementById(`status-${msg.index}`);
   if (!badge) return;
+  agents[msg.index].status = msg.status;
 
   badge.className = `status-badge status-${msg.status}`;
 
@@ -714,6 +765,11 @@ function updateAgent(msg) {
     error: '✗ Error'
   };
   badge.innerHTML = labels[msg.status] || msg.status;
+  const statuses = Object.values(agents).map(agent => agent.status);
+  if (statuses.length && statuses.every(status => status === 'done' || status === 'error')
+      && statuses.some(status => status === 'done')) {
+    showSynthesisProgress('generating');
+  }
 }
 
 function showResult(msg) {
@@ -776,10 +832,75 @@ function toggleAnswer(index) {
   if (btn) btn.textContent = collapsed ? 'Show more ▾' : 'Show less ▴';
 }
 
+function resetSynthesisProgress() {
+  clearInterval(synthesisTimer);
+  synthesisTimer = null;
+  synthesisPending = false;
+  reportReady = false;
+  document.getElementById('synthesis-progress').hidden = true;
+  document.getElementById('report-content').hidden = false;
+}
+
+function updateSynthesisProgress() {
+  if (!synthesisPending) return;
+  // This is a time-based estimate; only receiving the report means 100%.
+  const elapsed = Math.max(0, performance.now() - synthesisStartedAt);
+  const percent = Math.min(95, Math.max(0, Math.floor(100 * (1 - Math.exp(-elapsed / 45000)))));
+  document.getElementById('synthesis-bar').value = percent;
+  document.getElementById('synthesis-percent').textContent = `${percent}%`;
+  document.getElementById('synthesis-detail').textContent = percent < 95
+    ? ''
+    : 'Still generating. Waiting for the model to finish.';
+}
+
+function showSynthesisProgress(status) {
+  if (reportReady) return;
+  if (!synthesisPending) {
+    synthesisPending = true;
+    synthesisStartedAt = performance.now();
+    synthesisTimer = setInterval(updateSynthesisProgress, 1000);
+    updateSynthesisProgress();
+  }
+  document.getElementById('report-section').classList.add('visible');
+  document.getElementById('report-content').hidden = true;
+  document.getElementById('synthesis-progress').hidden = false;
+  document.getElementById('synthesis-spinner').hidden = false;
+  document.getElementById('synthesis-bar').hidden = false;
+  document.getElementById('synthesis-bar').setAttribute('aria-label', 'Estimated summary generation progress');
+  document.getElementById('synthesis-message').textContent = status === 'compiling'
+    ? 'Compiling completed answers...'
+    : 'Generating summary...';
+}
+
+function interruptSynthesis(message) {
+  if (!synthesisPending) return;
+  clearInterval(synthesisTimer);
+  synthesisTimer = null;
+  synthesisPending = false;
+  document.getElementById('synthesis-spinner').hidden = true;
+  document.getElementById('synthesis-bar').hidden = true;
+  document.getElementById('synthesis-percent').textContent = '';
+  document.getElementById('synthesis-message').textContent = message;
+  document.getElementById('synthesis-detail').textContent = '';
+}
+
 function showReport(markdown) {
+  if (!document.getElementById('synthesis-progress').hidden) {
+    document.getElementById('synthesis-message').textContent = 'Report ready';
+    document.getElementById('synthesis-percent').textContent = '100%';
+    document.getElementById('synthesis-bar').value = 100;
+    document.getElementById('synthesis-bar').hidden = false;
+    document.getElementById('synthesis-bar').setAttribute('aria-label', 'Report generation complete');
+    document.getElementById('synthesis-spinner').hidden = true;
+    document.getElementById('synthesis-detail').textContent = '';
+  }
+  clearInterval(synthesisTimer);
+  synthesisTimer = null;
+  synthesisPending = false;
+  reportReady = true;
+  document.getElementById('report-content').hidden = false;
   document.getElementById('report-content').innerHTML = simpleMarkdown(markdown);
   document.getElementById('report-section').classList.add('visible');
-  document.getElementById('research-btn').disabled = false;
 }
 
 function addLog(message, level = 'info') {
@@ -851,6 +972,14 @@ function escapeHtml(text) {
 }
 
 // ── Sandbox management panel ─────────────────────────
+let managementPending = false;
+let hasDiskImage = false;
+
+function updateManagementButtons() {
+  document.getElementById('btn-recreate').disabled = managementPending;
+  document.getElementById('btn-delete').disabled = managementPending || !hasDiskImage;
+}
+
 async function refreshSandboxInfo() {
   try {
     const r = await fetch('/api/sandbox/info');
@@ -868,8 +997,8 @@ function applySandboxInfo(info) {
   document.getElementById('mgmt-runtime').textContent = `${(st.total_sandbox_seconds || 0).toFixed(1)} s`;
   document.getElementById('mgmt-runs').textContent    = (st.total_sandbox_runs || 0);
   document.getElementById('mgmt-live').textContent    = (st.live_sandboxes || 0);
-  // Buttons enable/disable based on whether a disk image is cached
-  document.getElementById('btn-delete').disabled = !di.disk_image_id;
+  hasDiskImage = Boolean(di.disk_image_id);
+  updateManagementButtons();
 }
 
 function setStat(id, value, fullTitle) {
@@ -889,13 +1018,13 @@ function setStat(id, value, fullTitle) {
 function shortId(id)      { return id ? (id.length > 28 ? id.slice(0, 12) + '…' + id.slice(-8) : id) : null; }
 function shortDigest(d)   { return d ? d.slice(0, 19) + '…' : null; }
 
-async function callMgmt(method, path, btnId) {
-  const btnRecreate = document.getElementById('btn-recreate');
-  const btnDelete   = document.getElementById('btn-delete');
-  btnRecreate.disabled = true;
-  btnDelete.disabled = true;
+async function callMgmt(method, path) {
+  if (managementPending) return;
+  managementPending = true;
+  updateManagementButtons();
   try {
     const r = await fetch(path, { method });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
     const data = await r.json();
     (data.logs || []).forEach(l => addLog(l.message, l.level || 'info'));
     if (data.error) addLog(data.error, 'error');
@@ -903,6 +1032,8 @@ async function callMgmt(method, path, btnId) {
   } catch (ex) {
     addLog('Management request failed: ' + ex, 'error');
   } finally {
+    managementPending = false;
+    updateManagementButtons();
     refreshSandboxInfo();
   }
 }

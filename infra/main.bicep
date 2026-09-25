@@ -1,18 +1,8 @@
 // ============================================================================
-// ACA Sandboxes — Research Agent Swarm Infrastructure
+// ACA Sandboxes — Research Agent Fan-Out Infrastructure
 // ============================================================================
-// Deploys: Azure OpenAI (GPT-4o), ACR, ACA Environment + Orchestrator app,
-//          and a Microsoft.App/sandboxGroups resource for the research swarm.
-//
-// Sandboxes themselves are dynamic: the orchestrator creates them at runtime
-// against the sandbox group via the data plane (management.azuredevcompute.io).
-//
-// NOTE on disk images: Disk images live behind the *data plane* of the sandbox
-// group, not ARM, so they cannot be pre-created in Bicep. The orchestrator
-// pre-warms a disk image in its FastAPI lifespan startup hook (see
-// `orchestrator.py`) so the first user request doesn't pay the ~25 s build
-// cost. The disk image is then cached by ACR manifest digest across runs and
-// only rebuilt when a new image is pushed (or via the UI's Re-create button).
+// Deploys: Azure OpenAI (GPT-5mini), ACR, ACA Environment + Orchestrator app,
+//          and a Microsoft.App/sandboxGroups resource for the research fan-out.
 // ============================================================================
 
 targetScope = 'resourceGroup'
@@ -25,7 +15,7 @@ param prefix string = 'aca-sandboxes-agents'
 @description('Azure region for deployment')
 param location string = resourceGroup().location
 
-@description('Azure region for the Azure OpenAI account. Defaults to westus3 because gpt-5-mini (a reasoning model required for the newest Agent Framework) is not available in every region.')
+@description('Azure region for the Azure OpenAI account. Defaults to westus; choose a region that supports gpt-5-mini.')
 param openAiLocation string = 'westus'
 
 @description('gpt-5-mini model version. Leave empty to use the regional default version.')
@@ -73,9 +63,6 @@ var foundryUserRoleId             = '53ca6127-db72-4b80-b1b0-d745d6d5456d'
 // Custom role: Dev Compute SandboxGroup Data Owner
 var sandboxGroupDataOwnerRoleId   = 'c24cf47c-5077-412d-a19c-45202126392c'
 
-// Resource IDs computed as strings (force runtime resolution; works around Bicep
-// symbolic-name codegen that strips `identity` from preview-API resources).
-var orchestratorAppResourceId = resourceId('Microsoft.App/containerApps', orchestratorAppName)
 var sandboxGroupResourceId    = resourceId('Microsoft.App/sandboxGroups', sandboxGroupName)
 
 // ── User-Assigned Managed Identities ────────────────────────────────────────
@@ -127,7 +114,12 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
   location: location
   sku: { name: acrSku }
   properties: {
-    adminUserEnabled: true
+    adminUserEnabled: false
+    policies: {
+      azureADAuthenticationAsArmPolicy: {
+        status: 'enabled'
+      }
+    }
   }
 }
 
@@ -231,6 +223,11 @@ resource sandboxGroup 'Microsoft.App/sandboxGroups@2026-02-01-preview' = {
 resource orchestratorApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: orchestratorAppName
   location: location
+  dependsOn: [
+    orchestratorAcrPull
+    sandboxGroupAcrPull
+    orchestratorSandboxDataOwner
+  ]
   // Tags consumed by `azd` to wire `azd deploy <service>` to this resource.
   tags: union(
     { 'azd-service-name': azdServiceName },
@@ -245,15 +242,7 @@ resource orchestratorApp 'Microsoft.App/containerApps@2024-03-01' = {
   properties: {
     managedEnvironmentId: acaEnvironment.id
     configuration: {
-      secrets: [
-        // ACR admin credentials for disk-image pulls. The sandbox compute plane
-        // cannot yet authenticate ACR pulls with a managed identity, so the
-        // disk-image create call passes registry credentials explicitly. This is
-        // scoped to the orchestrator's internal bootstrap; sandbox egress stays
-        // keyless and default-deny.
-        { name: 'acr-username', value: acr.listCredentials().username }
-        { name: 'acr-password', value: acr.listCredentials().passwords[0].value }
-      ]
+      secrets: []
       ingress: {
         external: true
         targetPort: 5000
@@ -262,8 +251,7 @@ resource orchestratorApp 'Microsoft.App/containerApps@2024-03-01' = {
       registries: [
         {
           server: acr.properties.loginServer
-          username: acr.listCredentials().username
-          passwordSecretRef: 'acr-password'
+          identity: orchestratorUami.id
         }
       ]
     }
@@ -286,12 +274,9 @@ resource orchestratorApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'SUBSCRIPTION_ID',         value: subscription().subscriptionId }
             { name: 'RESOURCE_GROUP',          value: resourceGroup().name }
             { name: 'SANDBOX_GROUP',           value: sandboxGroupName }
-            { name: 'SANDBOX_GROUP_UAMI_RESOURCE_ID', value: sandboxGroupUami.id }
             { name: 'SANDBOX_GROUP_UAMI_CLIENT_ID', value: sandboxGroupUami.properties.clientId }
             { name: 'DEFAULT_REGION',          value: location }
             { name: 'ACR_LOGIN_SERVER',        value: acr.properties.loginServer }
-            { name: 'ACR_USERNAME',            secretRef: 'acr-username' }
-            { name: 'ACR_PASSWORD',            secretRef: 'acr-password' }
             { name: 'DISK_IMAGE_ID',           value: !empty(researchAgentImage) ? researchAgentImage : '${acr.properties.loginServer}/research-agent:latest' }
             // OpenTelemetry → Application Insights. Drives agent-run / tool-call /
             // sandbox spans. The same connection string is forwarded into each
@@ -387,6 +372,7 @@ output orchestratorUrl         string = 'https://${orchestratorApp.properties.co
 output orchestratorPrincipalId string = orchestratorUami.properties.principalId
 output sandboxGroupName        string = sandboxGroup.name
 output sandboxGroupId          string = sandboxGroup.id
+output sandboxGroupUamiClientId string = sandboxGroupUami.properties.clientId
 output resourceGroupName       string = resourceGroup().name
 output subscriptionId          string = subscription().subscriptionId
 output applicationInsightsName string = appInsights.name

@@ -1,6 +1,11 @@
 {
     "chat.tools.terminal.autoApprove": {
         "git config": true,
-        "git credential-manager": true
+        "git credential-manager": true,
+        "&": true,
+        "/^node --test \\.\\\\orchestrator\\\\tests\\\\test_ui\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

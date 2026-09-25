@@ -42,9 +42,11 @@ Microsoft Agent Framework gives us the agents and the workflow graph. The decomp
 
 Then the synthesizer receives the researcher responses through fan-in and produces the final Markdown report.
 
+Failed researchers do not stop the other branches. The report uses only usable, non-simulated answers and labels partial coverage. If synthesis fails or returns no text, the completed answers and sources are compiled without another model call. Token-rate warnings point to the deployment's "Tokens per Minute Rate Limit" in Foundry; full exceptions remain in server logs.
+
 The surprising part was the fan-out.
 
-It is tempting to express all researchers as one fan-out edge group. That looks correct on a whiteboard. In this implementation, however, one fan-out runner would deliver targeted messages sequentially. The graph would look parallel while the researcher model calls were serialized inside that runner.
+It is tempting to express all researchers as one fan-out edge group. That looks correct on a whiteboard. In this implementation, however, one fan-out runner would deliver targeted messages sequentially. The graph would look parallel while the sandbox runs were serialized inside that runner.
 
 So the workflow creates an individual edge for every researcher:
 
@@ -61,9 +63,9 @@ workflow = builder.add_fan_in_edges(
 
 That is intentional. Separate edge runners let Microsoft Agent Framework schedule the researcher branches concurrently instead of putting six calls behind one delivery loop.
 
-Each researcher agent stays deliberately thin. It has one tool, `run_in_sandbox`. The tool creates the sandbox, waits for the in-sandbox research process, retrieves the structured result, and deletes the sandbox. The researcher returns that result verbatim rather than asking another model call to rewrite it.
+Each researcher branch is a deterministic MAF executor. Its runner creates the sandbox, waits for the in-sandbox research process, retrieves the result, and deletes the sandbox. No outer model call is needed to dispatch research or repeat the result; the research agent inside the sandbox still uses MAF.
 
-The workflow coordinates reasoning. The sandbox tool owns isolated execution.
+The workflow coordinates reasoning. The sandbox runner owns isolated execution.
 
 Container Apps orchestrates. Sandboxes execute.
 
@@ -161,7 +163,7 @@ The connection happens through W3C trace context. Before sandbox creation, the o
 The result is one trace path designed to connect:
 
 - Topic decomposition
-- Researcher agent and `run_in_sandbox` tool activity
+- Researcher workflow executor activity
 - Sandbox creation and instrumented lifecycle or network operations
 - In-sandbox Microsoft Agent Framework research and Foundry calls
 - Fan-in and synthesis

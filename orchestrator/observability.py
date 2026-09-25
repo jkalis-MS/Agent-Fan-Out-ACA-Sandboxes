@@ -1,9 +1,9 @@
 """OpenTelemetry wiring for the orchestrator.
 
 Sends traces, metrics, and logs to Application Insights and turns on the
-Microsoft Agent Framework's built-in instrumentation, so every agent run and
-tool call (including ``run_in_sandbox``) shows up as a span. Sandbox lifecycle
-spans are added in ``sandbox_manager`` on top of this.
+Microsoft Agent Framework's built-in instrumentation for workflow execution,
+agent runs, and tool calls. Sandbox lifecycle spans are added in
+``sandbox_manager`` on top of this.
 
 Everything here is a no-op when ``APPLICATIONINSIGHTS_CONNECTION_STRING`` is not
 set, so local runs without App Insights keep working.

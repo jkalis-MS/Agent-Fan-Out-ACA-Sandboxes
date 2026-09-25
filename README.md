@@ -57,4 +57,4 @@ cp .env.example .env    # fill in values from the deployment outputs
 python orchestrator.py
 ```
 
-Because you authenticate as yourself locally, grant your user the same two roles the orchestrator's managed identity has in Azure: `Dev Compute SandboxGroup Data Owner` on the sandbox group and `Cognitive Services OpenAI User` on the Azure OpenAI account. Then open http://localhost:5000 and submit a topic.
+Because you authenticate as yourself locally, grant your user `ACA SandboxGroup Data Owner` on the sandbox group, `Cognitive Services OpenAI User` on the Azure OpenAI account, and `AcrPull` on ACR for image digest lookups. Set `SANDBOX_GROUP_UAMI_CLIENT_ID` from the `sandboxGroupUamiClientId` deployment output so the sandbox service pulls research-agent images using its managed identity. Then open http://localhost:5000 and submit a topic.

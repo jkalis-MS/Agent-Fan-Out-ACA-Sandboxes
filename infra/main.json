@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.42.1.51946",
-      "templateHash": "10953018439765328098"
+      "templateHash": "3050433265902243267"
     }
   },
   "parameters": {
@@ -27,21 +27,21 @@
       "type": "string",
       "defaultValue": "westus",
       "metadata": {
-        "description": "Azure region for the Azure OpenAI account. Defaults to westus3 because gpt-4o is not available in every region (e.g., westcentralus)."
+        "description": "Azure region for the Azure OpenAI account. Defaults to westus; choose a region that supports gpt-5-mini."
       }
     },
-    "gpt4oModelVersion": {
+    "gpt5MiniModelVersion": {
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "GPT-4o model version. Leave empty to use the regional default version."
+        "description": "gpt-5-mini model version. Leave empty to use the regional default version."
       }
     },
-    "gpt4oCapacity": {
+    "gpt5MiniCapacity": {
       "type": "int",
       "defaultValue": 50,
       "metadata": {
-        "description": "GPT-4o deployment capacity (TPM in thousands). 6 parallel researchers x ~5K tokens per call ~= 30K TPM peak; 50 gives a safe headroom."
+        "description": "gpt-5-mini deployment capacity (TPM in thousands). 6 parallel researchers plus reasoning tokens; 50 gives safe headroom."
       }
     },
     "orchestratorImage": {
@@ -101,7 +101,6 @@
     "cognitiveServicesOpenAIUserId": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
     "foundryUserRoleId": "53ca6127-db72-4b80-b1b0-d745d6d5456d",
     "sandboxGroupDataOwnerRoleId": "c24cf47c-5077-412d-a19c-45202126392c",
-    "orchestratorAppResourceId": "[resourceId('Microsoft.App/containerApps', variables('orchestratorAppName'))]",
     "sandboxGroupResourceId": "[resourceId('Microsoft.App/sandboxGroups', variables('sandboxGroupName'))]",
     "quickstartImage": "mcr.microsoft.com/k8se/quickstart:latest",
     "foundryProjectEndpoint": "[format('https://{0}.services.ai.azure.com/api/projects/{1}', variables('openAiName'), variables('aiProjectName'))]"
@@ -155,7 +154,12 @@
         "name": "[parameters('acrSku')]"
       },
       "properties": {
-        "adminUserEnabled": true
+        "adminUserEnabled": false,
+        "policies": {
+          "azureADAuthenticationAsArmPolicy": {
+            "status": "enabled"
+          }
+        }
       }
     },
     {
@@ -179,13 +183,13 @@
     {
       "type": "Microsoft.CognitiveServices/accounts/deployments",
       "apiVersion": "2024-10-01",
-      "name": "[format('{0}/{1}', variables('openAiName'), 'gpt-4o')]",
+      "name": "[format('{0}/{1}', variables('openAiName'), 'gpt-5-mini')]",
       "sku": {
-        "name": "Standard",
-        "capacity": "[parameters('gpt4oCapacity')]"
+        "name": "GlobalStandard",
+        "capacity": "[parameters('gpt5MiniCapacity')]"
       },
       "properties": {
-        "model": "[union(createObject('format', 'OpenAI', 'name', 'gpt-4o'), if(empty(parameters('gpt4oModelVersion')), createObject(), createObject('version', parameters('gpt4oModelVersion'))))]"
+        "model": "[union(createObject('format', 'OpenAI', 'name', 'gpt-5-mini'), if(empty(parameters('gpt5MiniModelVersion')), createObject(), createObject('version', parameters('gpt5MiniModelVersion'))))]"
       },
       "dependsOn": [
         "[resourceId('Microsoft.CognitiveServices/accounts', variables('openAiName'))]"
@@ -261,16 +265,7 @@
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
         "configuration": {
-          "secrets": [
-            {
-              "name": "acr-username",
-              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').username]"
-            },
-            {
-              "name": "acr-password",
-              "value": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').passwords[0].value]"
-            }
-          ],
+          "secrets": [],
           "ingress": {
             "external": true,
             "targetPort": 5000,
@@ -279,8 +274,7 @@
           "registries": [
             {
               "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').loginServer]",
-              "username": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').username]",
-              "passwordSecretRef": "acr-password"
+              "identity": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('orchestratorUamiName'))]"
             }
           ]
         },
@@ -304,7 +298,7 @@
                 },
                 {
                   "name": "AZURE_OPENAI_DEPLOYMENT",
-                  "value": "gpt-4o"
+                  "value": "gpt-5-mini"
                 },
                 {
                   "name": "FOUNDRY_PROJECT_ENDPOINT",
@@ -323,10 +317,6 @@
                   "value": "[variables('sandboxGroupName')]"
                 },
                 {
-                  "name": "SANDBOX_GROUP_UAMI_RESOURCE_ID",
-                  "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('sandboxGroupUamiName'))]"
-                },
-                {
                   "name": "SANDBOX_GROUP_UAMI_CLIENT_ID",
                   "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('sandboxGroupUamiName')), '2023-01-31').clientId]"
                 },
@@ -339,20 +329,16 @@
                   "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').loginServer]"
                 },
                 {
-                  "name": "ACR_USERNAME",
-                  "secretRef": "acr-username"
-                },
-                {
-                  "name": "ACR_PASSWORD",
-                  "secretRef": "acr-password"
-                },
-                {
                   "name": "DISK_IMAGE_ID",
                   "value": "[if(not(empty(parameters('researchAgentImage'))), parameters('researchAgentImage'), format('{0}/research-agent:latest', reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-11-01-preview').loginServer))]"
                 },
                 {
                   "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
                   "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').ConnectionString]"
+                },
+                {
+                  "name": "OTEL_SERVICE_NAME",
+                  "value": "orchestrator"
                 },
                 {
                   "name": "ENABLE_INSTRUMENTATION",
@@ -375,8 +361,12 @@
         "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
         "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
         "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', variables('openAiName'), 'gpt-5-mini')]",
         "[resourceId('Microsoft.CognitiveServices/accounts', variables('openAiName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('orchestratorUamiName')), variables('acrPullRoleId')))]",
+        "[extensionResourceId(resourceId('Microsoft.App/sandboxGroups', variables('sandboxGroupName')), 'Microsoft.Authorization/roleAssignments', guid(variables('sandboxGroupResourceId'), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('orchestratorUamiName')), variables('sandboxGroupDataOwnerRoleId')))]",
         "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('orchestratorUamiName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('sandboxGroupUamiName')), variables('acrPullRoleId')))]",
         "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('sandboxGroupUamiName'))]"
       ]
     },
@@ -475,7 +465,7 @@
     },
     "openAiDeployment": {
       "type": "string",
-      "value": "gpt-4o"
+      "value": "gpt-5-mini"
     },
     "foundryProjectEndpoint": {
       "type": "string",
@@ -508,6 +498,10 @@
     "sandboxGroupId": {
       "type": "string",
       "value": "[resourceId('Microsoft.App/sandboxGroups', variables('sandboxGroupName'))]"
+    },
+    "sandboxGroupUamiClientId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('sandboxGroupUamiName')), '2023-01-31').clientId]"
     },
     "resourceGroupName": {
       "type": "string",

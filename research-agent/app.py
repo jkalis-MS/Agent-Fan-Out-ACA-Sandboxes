@@ -33,8 +33,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # The sandbox egress proxy does TLS interception. The Azure Monitor exporter
 # talks to App Insights through `requests` (via azure-core), which does not honor
 # the *_CA_BUNDLE env vars the same way, so force-disable verification for every
-# requests Session. This is safe here: all egress is already restricted to an
-# allow-list by the sandbox's default-deny egress policy.
+# requests Session. This bypasses server-certificate validation; the egress
+# allow-list does not replace TLS authentication. Prefer trusting the proxy CA
+# when available.
 try:
     import requests as _rq
 
@@ -107,14 +108,33 @@ state_lock = threading.Lock()
 
 
 # ── Agent Framework research (Foundry hosted web search) ───────────────
+def _read_forwarded_token(token_name: str):
+    """Read a static bearer token with the issuer's Unix expiry, never renew it."""
+    from azure.core.credentials import AccessToken
+
+    token = os.environ.get(token_name, "")
+    if not token:
+        raise RuntimeError(f"{token_name} is missing from the sandbox environment.")
+    expiry_name = f"{token_name}_EXPIRES_ON"
+    try:
+        expires_on = int(os.environ[expiry_name])
+    except (KeyError, ValueError):
+        raise RuntimeError(
+            f"{expiry_name} must be provided as an integer Unix timestamp."
+        ) from None
+    if expires_on <= time.time():
+        raise RuntimeError(
+            f"{token_name} has expired; forwarded tokens cannot renew inside the sandbox."
+        )
+    return AccessToken(token, expires_on)
+
+
 async def _run_agent_research(question: str) -> dict:
     """Use Microsoft Agent Framework + Foundry's hosted web-search tool.
 
     The search executes server-side in the Foundry project, so this sandbox
     never calls a search engine directly — it only talks to the Foundry endpoint.
     """
-    import time as _time
-
     import httpx
     from agent_framework import Agent
     from agent_framework.foundry import FoundryChatClient
@@ -123,7 +143,7 @@ async def _run_agent_research(question: str) -> dict:
     from azure.core.pipeline.transport import AioHttpTransport
 
     project_endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
-    token = os.environ.get("AZURE_AI_TOKEN", "")
+    access_token = _read_forwarded_token("AZURE_AI_TOKEN")
     model = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 
     # The token is minted by the orchestrator's managed identity for the
@@ -132,7 +152,12 @@ async def _run_agent_research(question: str) -> dict:
     # egress-locked sandbox.
     class _ForwardedTokenCredential:
         async def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
-            return AccessToken(token, int(_time.time()) + 3000)
+            if access_token.expires_on <= time.time():
+                raise RuntimeError(
+                    "AZURE_AI_TOKEN has expired; forwarded tokens cannot renew "
+                    "inside the sandbox."
+                )
+            return access_token
 
         async def close(self) -> None:
             return None
@@ -207,7 +232,7 @@ def _call_openai_direct(question: str) -> dict:
     from openai import AzureOpenAI
 
     endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
-    token = os.environ.get("AZURE_OPENAI_TOKEN", "")
+    token = _read_forwarded_token("AZURE_OPENAI_TOKEN").token
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 
     # ADC egress proxy does TLS interception — use custom httpx client with verify=False.
